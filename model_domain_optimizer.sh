@@ -19,7 +19,7 @@ we_list=()
 sn_list=()
 
 min_tile=10
-perturb_percent=10
+perturb_percent=5
 
 # --- Parse Arguments ---
 while [[ $# -gt 0 ]]; do
