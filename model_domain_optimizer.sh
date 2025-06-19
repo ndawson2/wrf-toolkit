@@ -7,7 +7,7 @@ IFS=$'\n\t'
 # --- Default Parameters ---
 enable_parallel_io=false
 disable_grid_perturb=false
-nests=1a
+nests=1
 nio_groups=""
 nio_tasks_per_group=""
 cores_per_node=128
@@ -19,7 +19,7 @@ we_list=()
 sn_list=()
 
 min_tile=10
-perturb_percent=5
+perturb_percent=10
 
 # --- Parse Arguments ---
 while [[ $# -gt 0 ]]; do
@@ -42,8 +42,21 @@ done
 
 # --- Recommend NIO setup if enabled ---
 if [[ "$enable_parallel_io" == true ]]; then
-  [[ -z $nio_groups ]] && nio_groups=$nests
-  [[ -z $nio_tasks_per_group ]] && nio_tasks_per_group=2
+  if [[ -z $nio_groups && -z $nio_tasks_per_group ]]; then
+    for setting in "1x2" "2x2" "2x4" "4x2"; do
+      g=${setting%x*}
+      t=${setting#*x}
+      total_io=$(( g * t ))
+      compute=$(( cores_per_node - total_io ))
+      (( compute > 0 )) || continue
+      nio_groups=$g
+      nio_tasks_per_group=$t
+      break
+    done
+  else
+    [[ -z $nio_groups ]] && nio_groups=$nests
+    [[ -z $nio_tasks_per_group ]] && nio_tasks_per_group=2
+  fi
 else
   nio_groups=0
   nio_tasks_per_group=0
@@ -72,10 +85,12 @@ for ((i=0; i<nests; i++)); do
 done
 
 # --- Evaluate decompositions ---
-echo -e "\n🔍 Optimizing tiling from 1 to $max_nodes nodes..."
+echo -e "\nOptimizing tiling from 1 to $max_nodes nodes..."
 best_overall_score=0
 best_overall_summary=""
 declare -a valid_summaries
+all_failed=true
+
 for nodes in $(seq 1 $max_nodes); do
   total_cores=$((nodes * cores_per_node))
   io_cores=$((nio_groups * nio_tasks_per_group))
@@ -95,7 +110,7 @@ for nodes in $(seq 1 $max_nodes); do
       (( npy % nio_tasks_per_group != 0 )) && continue
     fi
 
-    (( npx * npy + io_cores != total_cores )) && continue
+    (( npx * npy > compute_cores )) && continue
 
     valid=true
     unset tx1 ty1 tx2 ty2
@@ -138,13 +153,34 @@ for nodes in $(seq 1 $max_nodes); do
 
     [[ "$valid" == false ]] && continue
 
-    score=$(awk -v tx1=${tx1:-1} -v ty1=${ty1:-1} -v tx2=${tx2:-1} -v ty2=${ty2:-1} '
+    for ((i=0; i<nests; i++)); do
+      ew=$( (( i == 0 )) && echo $we_out1 || echo $we_out2 )
+      sn=$( (( i == 0 )) && echo $sn_out1 || echo $sn_out2 )
+      layout_x=$npx
+      layout_y=$npy
+
+      tile_x=$(( ew / layout_x ))
+      tile_y=$(( sn / layout_y ))
+      if (( tile_x < min_tile || tile_y < min_tile )); then
+        valid=false
+        break
+      fi
+    done
+
+    [[ "$valid" == false ]] && continue
+
+    score=$(awk -v tx1=${tx1:-1} -v ty1=${ty1:-1} -v tx2=${tx2:-1} -v ty2=${ty2:-1} -v n=$nests '
       BEGIN {
-        ar1 = tx1 / ty1;
-        ar2 = tx2 / ty2;
-        ar_diff = sqrt((ar1 - 1)^2 + (ar2 - 1)^2);
-        avg_area = (tx1 * ty1 + tx2 * ty2) / 2;
-        score = avg_area / (1 + ar_diff^2);
+        if (n == 1) {
+          ar1 = tx1 / ty1;
+          score = (tx1 * ty1) / (1 + (ar1 - 1)^2);
+        } else {
+          ar1 = tx1 / ty1;
+          ar2 = tx2 / ty2;
+          ar_diff = sqrt((ar1 - 1)^2 + (ar2 - 1)^2);
+          avg_area = (tx1 * ty1 + tx2 * ty2) / 2;
+          score = avg_area / (1 + ar_diff^2);
+        }
         printf "%.1f", score;
       }')
 
@@ -152,8 +188,13 @@ for nodes in $(seq 1 $max_nodes); do
     if [[ "$better" == "1" ]]; then
       best_score=$score
       best_layout="$npx x $npy"
-      best_tile_sizes="d01: ${tx1}x${ty1}, d02: ${tx2}x${ty2}"
-      best_grid_sizes="d01: ${we_out1}x${sn_out1}, d02: ${we_out2}x${sn_out2}"
+      if (( nests == 1 )); then
+        best_tile_sizes="d01: ${tx1}x${ty1}"
+        best_grid_sizes="d01: ${we_out1}x${sn_out1}"
+      else
+        best_tile_sizes="d01: ${tx1}x${ty1}, d02: ${tx2}x${ty2}"
+        best_grid_sizes="d01: ${we_out1}x${sn_out1}, d02: ${we_out2}x${sn_out2}"
+      fi
     fi
   done
 
@@ -161,6 +202,7 @@ for nodes in $(seq 1 $max_nodes); do
     summary=$(printf "✅ Nodes: %2d  Cores: %4d  Compute Ranks: %4d  →  Layout: %-10s  | %-25s | Grid: %-20s | NIO: %dx%d | score=%s" \
       "$nodes" "$total_cores" "$compute_cores" "$best_layout" "$best_tile_sizes" "$best_grid_sizes" "$nio_groups" "$nio_tasks_per_group" "$best_score")
     valid_summaries+=("$best_score|$summary")
+    all_failed=false
   else
     printf "🚫 Nodes: %2d  Cores: %4d  Compute Ranks: %4d  →  No valid layout found\n" \
       "$nodes" "$total_cores" "$compute_cores"
@@ -171,4 +213,6 @@ done
 if (( ${#valid_summaries[@]} > 0 )); then
   echo -e "\nSorted Valid Layouts by Score:"
   printf "%s\n" "${valid_summaries[@]}" | sort -nr -t '|' -k1 | cut -d'|' -f2-
+elif [[ "$enable_parallel_io" == true ]]; then
+  echo -e "\n⚠️  No valid decompositions found. Consider adjusting --nio-tasks-per-group (e.g., try 2 or 4)."
 fi
